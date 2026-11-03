@@ -73,5 +73,16 @@ En `%LOCALAPPDATA%\ClaudeUsage`, por usuario:
 - `docs/LEEME-EQUIPO.txt` — guía breve para quien solo lo usa.
 - `diseno/panel-visual.dc.html` — maqueta del diseño.
 
+## Licencia
+
+Copyright (C) 2026 ramagu. Software libre bajo la
+[GNU General Public License v3.0](LICENSE): puedes usarlo, estudiarlo,
+modificarlo y redistribuirlo, siempre que las versiones que distribuyas
+mantengan la misma licencia y publiquen su código. Se ofrece sin ninguna
+garantía.
+
+La licencia cubre el código. El logo de Claude (`assets/` y `diseno/assets/`)
+es marca de Anthropic y no está incluido en ella.
+
 Claude y sus marcas pertenecen a Anthropic. Herramienta no oficial: usa la
 interfaz interna de claude.ai y puede dejar de funcionar si Claude la cambia.
