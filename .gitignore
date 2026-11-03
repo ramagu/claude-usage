@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.spec
+
+# PyInstaller: el .exe se publica en Releases
+build/
+dist/
+
+# Datos de cada usuario (viven en %LOCALAPPDATA%\ClaudeUsage, nunca aquí)
+config.json
+historial.db
+diagnostico.log
+*.csv
+
+# Sistema
+Thumbs.db
+desktop.ini
+.DS_Store

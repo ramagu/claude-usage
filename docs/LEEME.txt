@@ -1,0 +1,117 @@
+CLAUDE USAGE 1.2 — manual técnico
+=================================
+
+Arquitectura
+------------
+Un solo archivo, ClaudeUsage.pyw, solo biblioteca estándar de Python:
+
+  tkinter        panel, menú, historial y tarjeta del icono
+  ctypes         Shell_NotifyIcon (icono, avisos), TrackPopupMenu (menú
+                 contextual), DPAPI (cifrado), DWM (esquinas redondeadas)
+  urllib         peticiones a claude.ai
+  sqlite3        historial local
+  zlib/struct    lectura del PNG del logo, sin Pillow
+
+Todo lo que toca Tk ocurre en el hilo principal. Las lecturas van en un hilo
+aparte y llegan por una cola que Tk vacía cada 200 ms. Los eventos del icono
+se apuntan dentro del WndProc y se ejecutan después, fuera del despacho de
+mensajes de Windows.
+
+
+Icono de bandeja
+----------------
+- NOTIFYICON_VERSION_4 sin NIF_SHOWTIP: Windows no pinta su tooltip y envía
+  NIN_POPUPOPEN / NIN_POPUPCLOSE, donde se muestra la tarjeta propia.
+- NIN_SELECT = clic izquierdo (abrir/cerrar panel). WM_CONTEXTMENU = menú.
+- Si la versión 4 no está disponible, se usa WM_LBUTTONUP / WM_RBUTTONUP.
+- El HICON se genera tiñendo el alfa del logo (assets/claude-logo-256.png)
+  con el color del tramo, y se cachea por color y tamaño.
+- Con la barra de tareas clara (SystemUsesLightTheme = 1) se usan los tonos
+  oscuros de la paleta, que mantienen el contraste.
+- Se atiende TaskbarCreated y se vigila el icono cada 5 s: si Explorer se
+  reinicia, el icono se repone solo.
+
+
+Lecturas
+--------
+GET /api/organizations y /api/organizations/{uuid}/usage, con la cookie
+sessionKey. Solo se muestran los límites con etiqueta en LIMIT_LABELS
+(5 h, Semana, Opus, Sonnet, Haiku, Fable). Los códigos internos que devuelva
+claude.ai (por ejemplo «nimbus») se ignoran. Para mostrar un límite nuevo,
+basta con añadirlo a LIMIT_LABELS.
+
+Orden: 5 h y Semana fijos; el resto por consumo descendente; máximo 6 filas.
+
+Si la organización fijada devuelve todo a 0 se revalida cada 30 minutos.
+401 → clave caducada (se reintenta cada 5 min). Errores de red → reintento
+con espera creciente hasta 5 min.
+
+Atención: urllib no se identifica en la red igual que un navegador. Si
+Cloudflare bloquea las peticiones, el panel muestra "Sin conexión" con el
+detalle "Bloqueado por Cloudflare" en diagnostico.log.
+
+
+Avisos
+------
+Globo NIF_INFO con NIIF_USER | NIIF_LARGE_ICON, icono teñido del tramo y
+NIIF_NOSOUND salvo que se active el sonido. Windows 11 lo muestra como
+notificación. Título hasta 63 caracteres, texto hasta 255.
+
+Regla: cada umbral salta una sola vez por sesión. Se guarda en config.json
+como "clave|umbral" → resets_at de la sesión; al arrancar se respeta. Si se
+cruzan varios a la vez, solo se avisa del más alto. Con el panel abierto no
+se envía nada (se marca igualmente). Los avisos de clave caducada y sin
+conexión (tras 3 fallos) salen una vez por incidencia.
+
+
+Historial
+---------
+historial.db, tabla lecturas(ts, clave, pct, reinicio). Solo se escribe si
+el uso cambia, si empieza sesión o cada 5 minutos, y se purga a 730 días.
+Las consultas largas se agrupan en unos 700 intervalos (el pico de cada uno)
+para dibujar dos años sin cargar todo.
+
+Se ve con el botón de gráfico (Ver evolución): el gráfico en la columna
+izquierda bajo los semanales y la lista de sesiones en la derecha, bajo el
+consumo por minutos. Desde la 1.1 ya no está en el menú.
+
+
+Idiomas
+-------
+Español (texto de origen) e inglés. Cada texto de la interfaz pasa por T(),
+que busca su traducción en el diccionario EN; si falta, se queda en español.
+Los textos con datos llevan campos ({hora}, {n}…) para que cada idioma los
+coloque en su orden. Fechas (dom 1 nov / Sun, Nov 1), porcentajes (40 % /
+40%) y decimales (1,5 / 1.5) también cambian. El CSV usa ";" y coma decimal
+en español, "," y punto en inglés.
+
+config.json guarda "idioma": "auto", "es" o "en". Con "auto" se mira
+GetUserDefaultUILanguage: español para Windows en español, catalán, gallego
+o euskera; inglés para el resto. El registro (diagnostico.log) sigue en
+español.
+
+Para añadir un texto: escribirlo en español dentro de T("…") y añadir su
+traducción a EN.
+
+
+Colores
+-------
+Paleta ajustada en OKLCH. Normal: verde #0BE35E, amarillo #FFDE09, naranja
+#FE7802, rojo #F12941. Accesible: azul #63B0FC, ámbar #FFD16B, bermellón
+#FD6A25, magenta #DF2187. Cada uno con una variante oscura para la barra de
+tareas clara. Genérico #3B82F6, inactivo #91919B.
+
+Fuente: Inter si está instalada; si no, Segoe UI Variable o Segoe UI.
+
+
+Inicio con Windows
+------------------
+HKCU\Software\Microsoft\Windows\CurrentVersion\Run\ClaudeUsage, siempre con
+--silent. Es portable: si se mueve el .exe, la entrada antigua deja de
+contar como activa.
+
+
+Construir el .exe
+-----------------
+CONSTRUIR_EXE.bat instala PyInstaller y genera dist\ClaudeUsage.exe con
+assets\ dentro. Una sola instancia por usuario (mutex Local\ClaudeUsage).

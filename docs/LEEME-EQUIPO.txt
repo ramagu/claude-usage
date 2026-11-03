@@ -1,0 +1,52 @@
+CLAUDE USAGE — guía rápida
+==========================
+
+Qué es
+------
+Un icono junto al reloj de Windows que te dice cuánto te queda de Claude:
+la sesión de 5 horas, la semana y los límites de cada modelo.
+
+
+Primera vez
+-----------
+1. Abre ClaudeUsage.exe. Aparece la pantalla "Conecta tu cuenta de Claude".
+2. Sigue los pasos que muestra para copiar tu SessionKey desde claude.ai
+   (F12 › Application › Cookies › claude.ai › sessionKey).
+3. Pégala y pulsa Conectar (o Enter).
+
+La clave se guarda cifrada solo para tu usuario de Windows. No la compartas:
+quien la tenga puede entrar en tu cuenta de Claude.
+
+
+El día a día
+------------
+- Pasa el ratón por el icono: ves todos los límites de un vistazo.
+- Clic izquierdo: abre el panel. Otro clic, Esc o la X lo cierran.
+- Botón del gráfico, en el panel: evolución de la sesión y el historial.
+- Idioma (español o inglés): Menú › Preferencias › Idioma.
+- Clic derecho: menú (actualizar, iniciar con Windows, salir).
+
+El color del icono dice cómo vas:
+  verde     por debajo del 50 %
+  amarillo  desde el 50 %
+  naranja   desde el 70 %
+  rojo      desde el 85 %
+  azul      cargando o sin cuenta
+  gris      sin conexión o clave caducada
+
+La rayita blanca de cada barra es el ritmo ideal: si la barra la pasa, vas
+más rápido de lo que dura el límite.
+
+
+Avisos
+------
+Windows te avisa al cruzar cada umbral, una sola vez por sesión. Desde el
+menú (botón ≡ del panel) puedes elegir avisos de sesión, de semana, de
+reinicio y el sonido.
+
+
+Si algo falla
+-------------
+"SessionKey caducada": pulsa Renovar y pega una nueva. Pasa al cerrar sesión
+en claude.ai.
+"Sin conexión": el widget reintenta solo y mantiene el último dato.
