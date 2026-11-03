@@ -23,6 +23,10 @@ compartida: la SessionKey es personal):
 La aplicación usa la interfaz interna de claude.ai, no una API pública. Puede
 dejar de funcionar si Claude la cambia. Claude y sus marcas pertenecen a
 Anthropic; esta herramienta no es un producto oficial de Anthropic.
+
+Copyright (C) 2026 ramagu. Software libre bajo la licencia GNU GPL v3: puede
+redistribuirse y modificarse en sus términos, SIN NINGUNA GARANTÍA. Texto
+completo en LICENSE. El logo de Claude no está cubierto por esta licencia.
 """
 
 from __future__ import annotations
