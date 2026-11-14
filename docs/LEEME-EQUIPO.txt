@@ -18,6 +18,18 @@ La clave se guarda cifrada solo para tu usuario de Windows. No la compartas:
 quien la tenga puede entrar en tu cuenta de Claude.
 
 
+Actualizar
+----------
+Cuando se publica una versión nueva, Windows te avisa y en el panel aparece
+"Versión X disponible" con el botón Actualizar. Púlsalo: se descarga, se
+instala sola y se abre la nueva. Tu clave y tu historial siguen igual.
+
+Si te pasan un ClaudeUsage.exe más nuevo, basta con abrirlo: cierra la versión
+anterior, ocupa su lugar y manda el .exe antiguo a la papelera. Si el .exe
+antiguo estaba en OneDrive o en una carpeta compartida, no lo borra: quítalo
+tú si era solo tuyo.
+
+
 El día a día
 ------------
 - Pasa el ratón por el icono: ves todos los límites de un vistazo.

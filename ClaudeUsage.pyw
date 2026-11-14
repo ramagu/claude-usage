@@ -6,6 +6,7 @@ avisos y el cifrado de la clave.
 
     pythonw ClaudeUsage.pyw            abre el panel al arrancar
     pythonw ClaudeUsage.pyw --silent   arranca solo en la bandeja
+    ClaudeUsage.exe --actualizar       si hay una versión nueva publicada, la instala sin preguntar
 
 Interacción con el icono:
   - Pasar el ratón: tarjeta con todos los límites y la proyección.
@@ -33,6 +34,7 @@ from __future__ import annotations
 
 import base64
 import csv
+import hashlib
 import json
 import math
 import os
@@ -40,9 +42,11 @@ import queue
 import re
 import sqlite3
 import struct
+import subprocess
 import sys
 import threading
 import time
+import traceback  # noqa: F401 — ver la nota de abajo
 import tkinter as tk
 import tkinter.font as tkfont
 import urllib.error
@@ -51,7 +55,13 @@ import zlib
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-VERSION = "1.2.1"
+# Todos los módulos se cargan aquí arriba, ninguno dentro de una función. El .exe
+# lee sus módulos de su propio fichero cada vez que importa uno; al actualizarse,
+# ese fichero pasa a ser el de la versión nueva y un «import» tardío leería un
+# archivo que ya no es el suyo («Error -3 while decompressing data»). traceback
+# lo usa tkinter si una acción falla, y también lo importaría tarde.
+
+VERSION = "1.3.0"
 APP_NAME = "ClaudeUsage"
 TITULO = "Claude Usage"
 
@@ -208,6 +218,21 @@ EN = {
     "Uso semanal al {v} %": "Weekly usage at {v}%",
     "{modelo} (semanal) al {v} %": "{modelo} (weekly) at {v}%",
     "Reinicia el {cuando}, en {falta}.": "Resets {cuando}, in {falta}.",
+    # Versiones nuevas
+    "Hay una versión nueva de Claude Usage: {v}": "A new version of Claude Usage is available: {v}",
+    "Haz clic aquí para actualizar.": "Click here to update.",
+    "Versión {v} disponible": "Version {v} available",
+    "Descargando… {n} %": "Downloading… {n}%",
+    "No se pudo actualizar ({detalle}). Descárgala desde la web.": "Couldn't update ({detalle}). Download it from the website.",
+    "Tienes la {actual}. Se descarga y se instala sola.": "You have {actual}. It downloads and installs itself.",
+    "Tienes la {actual}. Descárgala desde la web.": "You have {actual}. Download it from the website.",
+    "Abrir la web": "Open website",
+    "Actualizar": "Update",
+    "Avisar de versiones nuevas": "Notify about new versions",
+    # Relevo de una versión anterior
+    "Claude Usage actualizado a la versión {v}": "Claude Usage updated to version {v}",
+    "La versión {anterior} se ha cerrado y esta ocupa su lugar. Tu clave y tu historial se conservan.":
+        "Version {anterior} has been closed and this one takes its place. Your key and history are kept.",
     # SessionKey
     "Eso no es la SessionKey: debe empezar por sk-ant-sid. Copia el valor de la fila sessionKey y pégalo de nuevo.":
         "That's not the SessionKey: it must start with sk-ant-sid. Copy the value of the sessionKey row and paste it again.",
@@ -520,6 +545,8 @@ class Config:
         self.aviso_reinicio = True
         self.sonido = False
         self.idioma = "auto"
+        self.buscar_versiones = True
+        self.version_avisada = ""       # última versión nueva de la que ya se avisó
         # "clave_limite|umbral" -> resets_at ISO de la sesión en la que ya se avisó.
         # Así cada aviso salta una sola vez por sesión, aunque se reinicie el programa.
         self.avisados = {}
@@ -548,6 +575,8 @@ class Config:
         cfg.aviso_reinicio = bool(crudo.get("aviso_reinicio", True))
         cfg.sonido = bool(crudo.get("sonido", False))
         cfg.idioma = crudo.get("idioma", "auto") if crudo.get("idioma") in IDIOMAS else "auto"
+        cfg.buscar_versiones = bool(crudo.get("buscar_versiones", True))
+        cfg.version_avisada = str(crudo.get("version_avisada", "") or "")
         avisados = crudo.get("avisados", {})
         cfg.avisados = {str(k): str(v) for k, v in avisados.items()} if isinstance(avisados, dict) else {}
         return cfg
@@ -565,6 +594,8 @@ class Config:
             "aviso_reinicio": self.aviso_reinicio,
             "sonido": self.sonido,
             "idioma": self.idioma,
+            "buscar_versiones": self.buscar_versiones,
+            "version_avisada": self.version_avisada,
             "avisados": self.avisados,
         }
         try:
@@ -1011,6 +1042,22 @@ if ES_WINDOWS:
 
     ID_PANEL, ID_ACTUALIZAR, ID_AUTOSTART, ID_ACERCA, ID_SALIR = 1, 2, 3, 4, 5
 
+    # Relevo de una versión anterior: procesos y papelera.
+    SYNCHRONIZE, PROCESS_TERMINATE, PROCESS_QUERY_LIMITED_INFORMATION = 0x00100000, 0x0001, 0x1000
+    WAIT_OBJECT_0 = 0
+    DRIVE_FIXED = 3
+    FO_DELETE = 3
+    FOF_SILENT, FOF_NOCONFIRMATION, FOF_ALLOWUNDO, FOF_NOERRORUI = 0x0004, 0x0010, 0x0040, 0x0400
+
+    class SHFILEOPSTRUCTW(ctypes.Structure):
+        if ctypes.sizeof(ctypes.c_void_p) == 4:
+            _pack_ = 1
+        _fields_ = [
+            ("hwnd", wintypes.HWND), ("wFunc", wintypes.UINT), ("pFrom", ctypes.c_void_p),
+            ("pTo", ctypes.c_void_p), ("fFlags", wintypes.WORD), ("fAnyOperationsAborted", wintypes.BOOL),
+            ("hNameMappings", ctypes.c_void_p), ("lpszProgressTitle", wintypes.LPCWSTR),
+        ]
+
     class GUID(ctypes.Structure):
         _fields_ = [("d1", wintypes.DWORD), ("d2", wintypes.WORD), ("d3", wintypes.WORD), ("d4", ctypes.c_byte * 8)]
 
@@ -1108,6 +1155,25 @@ if ES_WINDOWS:
         g.DeleteObject.argtypes = (wintypes.HGDIOBJ,)
         s.Shell_NotifyIconW.argtypes = (wintypes.DWORD, ctypes.c_void_p)
         s.Shell_NotifyIconW.restype = wintypes.BOOL
+        u.FindWindowW.argtypes = (wintypes.LPCWSTR, wintypes.LPCWSTR)
+        u.FindWindowW.restype = wintypes.HWND
+        u.GetWindowThreadProcessId.argtypes = (wintypes.HWND, ctypes.POINTER(wintypes.DWORD))
+        u.GetWindowThreadProcessId.restype = wintypes.DWORD
+        k.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        k.OpenProcess.restype = wintypes.HANDLE
+        k.QueryFullProcessImageNameW.argtypes = (wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR,
+                                                 ctypes.POINTER(wintypes.DWORD))
+        k.QueryFullProcessImageNameW.restype = wintypes.BOOL
+        k.TerminateProcess.argtypes = (wintypes.HANDLE, wintypes.UINT)
+        k.TerminateProcess.restype = wintypes.BOOL
+        k.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+        k.WaitForSingleObject.restype = wintypes.DWORD
+        k.CloseHandle.argtypes = (wintypes.HANDLE,)
+        k.CloseHandle.restype = wintypes.BOOL
+        k.GetDriveTypeW.argtypes = (wintypes.LPCWSTR,)
+        k.GetDriveTypeW.restype = wintypes.UINT
+        s.SHFileOperationW.argtypes = (ctypes.c_void_p,)
+        s.SHFileOperationW.restype = ctypes.c_int
         _FIRMAS = True
 
 
@@ -1135,6 +1201,328 @@ def es_unica_instancia() -> bool:
     declarar_firmas()
     _MUTEX = ctypes.windll.kernel32.CreateMutexW(None, False, "Local\\" + APP_NAME)
     return ctypes.windll.kernel32.GetLastError() != ERROR_ALREADY_EXISTS
+
+
+# =========================================================================== #
+# Relevo de una versión anterior
+#
+# Quien abre una versión nueva sin haber cerrado la antigua se quedaba con la
+# antigua: el mutex hacía que la nueva saliera sin avisar. Ahora la nueva cierra
+# a la antigua, se queda con el inicio con Windows y manda a la papelera el
+# ejecutable viejo, para que no convivan dos copias.
+# =========================================================================== #
+MENSAJE_RELEVO = "ClaudeUsage.Relevo"
+CLASE_BANDEJA = "ClaudeUsageTrayWnd"
+
+
+def version_tupla(texto: str) -> tuple:
+    return tuple(int(n) for n in re.findall(r"\d+", texto or "")[:3])
+
+
+def ultima_version_arrancada() -> str:
+    """Versión de la última copia que arrancó en este equipo, según el registro.
+
+    Si hay una copia en marcha es la suya: solo quien tiene el mutex escribe
+    «arranque X.Y.Z». Hay que leerla antes de registrar el arranque propio.
+    """
+    try:
+        texto = (carpeta_config() / "diagnostico.log").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    vistas = re.findall(r"arranque (\d+(?:\.\d+)+)", texto)
+    return vistas[-1] if vistas else ""
+
+
+def es_mas_antigua(otra: str, mia: str = VERSION) -> bool:
+    """Solo se toca una versión conocida y estrictamente anterior a esta."""
+    a, b = version_tupla(otra), version_tupla(mia)
+    return bool(a) and a < b
+
+
+def _ruta_proceso(proceso) -> str:
+    bufer = ctypes.create_unicode_buffer(32768)
+    largo = wintypes.DWORD(len(bufer))
+    if ctypes.windll.kernel32.QueryFullProcessImageNameW(proceso, 0, bufer, ctypes.byref(largo)):
+        return bufer.value
+    return ""
+
+
+def relevar_instancia(version_otra: str):
+    """Cierra la copia en marcha. Devuelve la ruta de su ejecutable ("" si no se
+    pudo saber) o None si no se la pudo cerrar."""
+    if not ES_WINDOWS:
+        return None
+    declarar_firmas()
+    u, k, s = ctypes.windll.user32, ctypes.windll.kernel32, ctypes.windll.shell32
+    hwnd = None
+    for _ in range(30):                  # puede estar todavía arrancando
+        hwnd = u.FindWindowW(CLASE_BANDEJA, None)
+        if hwnd:
+            break
+        time.sleep(0.1)
+    if not hwnd:
+        registrar("relevo: no se encuentra la copia en marcha")
+        return None
+    pid = wintypes.DWORD()
+    u.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    if not pid.value or pid.value == os.getpid():
+        return None
+    proceso = k.OpenProcess(SYNCHRONIZE | PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION, False, pid.value)
+    if not proceso:
+        registrar("relevo: no hay permiso para cerrar la copia en marcha")
+        return None
+    modo = "salió sola"
+    try:
+        ruta = _ruta_proceso(proceso)
+        # Por las buenas: desde la 1.3.0, la copia en marcha sale sola al recibirlo.
+        u.PostMessageW(hwnd, u.RegisterWindowMessageW(MENSAJE_RELEVO), 0, 0)
+        if k.WaitForSingleObject(proceso, 2000) != WAIT_OBJECT_0:
+            # Las anteriores no lo entienden: se quita su icono y se cierra el proceso.
+            icono = NOTIFYICONDATAW()
+            icono.cbSize = ctypes.sizeof(NOTIFYICONDATAW)
+            icono.hWnd = hwnd
+            icono.uID = 1
+            quitado = bool(s.Shell_NotifyIconW(NIM_DELETE, ctypes.byref(icono)))
+            if not k.TerminateProcess(proceso, 0):
+                registrar("relevo: no se pudo cerrar la copia en marcha")
+                return None
+            k.WaitForSingleObject(proceso, 5000)
+            s.Shell_NotifyIconW(NIM_DELETE, ctypes.byref(icono))   # por si lo repuso entre medias
+            modo = "cerrada a la fuerza; su icono " + ("se ha retirado" if quitado else "puede tardar en desaparecer")
+    finally:
+        k.CloseHandle(proceso)
+    registrar(f"relevo: cerrada la versión {version_otra} que estaba en marcha ({modo})")
+    return ruta
+
+
+def _misma_ruta(a: str, b: str) -> bool:
+    return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+
+
+def _dentro_de(ruta: str, carpeta: str) -> bool:
+    try:
+        r = os.path.normcase(os.path.abspath(ruta))
+        c = os.path.normcase(os.path.abspath(carpeta))
+        return os.path.commonpath([r, c]) == c
+    except ValueError:                   # unidades distintas
+        return False
+
+
+def carpetas_sincronizadas() -> list:
+    """Raíces de OneDrive y de bibliotecas de SharePoint o Teams sincronizadas."""
+    raices = [os.environ.get(v, "") for v in ("OneDrive", "OneDriveCommercial", "OneDriveConsumer")]
+    w = _winreg()
+    if w is not None:
+        try:
+            with w.OpenKey(w.HKEY_CURRENT_USER, r"Software\SyncEngines\Providers\OneDrive") as proveedores:
+                for i in range(w.QueryInfoKey(proveedores)[0]):
+                    try:
+                        with w.OpenKey(proveedores, w.EnumKey(proveedores, i)) as k:
+                            raices.append(str(w.QueryValueEx(k, "MountPoint")[0]))
+                    except OSError:
+                        continue
+        except OSError:
+            pass
+    return [r for r in raices if r]
+
+
+def motivo_para_no_retirar(ruta: str, propia: str, sincronizadas=None) -> str:
+    """Por qué NO se retira un ejecutable antiguo ("" si se puede retirar).
+
+    Solo se retira una copia local de Claude Usage dentro del perfil del
+    usuario. Lo que está en una carpeta sincronizada puede ser de varias
+    personas: borrarlo ahí lo borraría para todas.
+    """
+    if not ruta:
+        return "ruta desconocida"
+    nombre = os.path.basename(ruta).casefold()
+    if not (nombre.startswith(APP_NAME.casefold()) and nombre.endswith(".exe")):
+        return "no es un ejecutable de Claude Usage"
+    if _misma_ruta(ruta, propia):
+        return "es esta misma copia"
+    if not os.path.isfile(ruta):
+        return "ya no existe"
+    if (os.path.basename(ruta).casefold() == NOMBRE_ANTERIOR.casefold()
+            and _misma_ruta(os.path.dirname(ruta), os.path.dirname(propia))):
+        return ""                        # lo dejó aquí nuestra propia actualización: es nuestro
+    if not _dentro_de(ruta, str(Path.home())):
+        return "está fuera del perfil del usuario"
+    partes = [p.casefold() for p in Path(os.path.abspath(ruta)).parts]
+    if any(p.startswith(("onedrive", "dropbox", "google drive", "sharepoint")) for p in partes):
+        return "está en una carpeta sincronizada"
+    for raiz in (carpetas_sincronizadas() if sincronizadas is None else sincronizadas):
+        if _dentro_de(ruta, raiz):
+            return "está en una carpeta sincronizada"
+    if ES_WINDOWS:
+        unidad = os.path.splitdrive(os.path.abspath(ruta))[0] + "\\"
+        if ctypes.windll.kernel32.GetDriveTypeW(unidad) != DRIVE_FIXED:
+            return "no está en un disco local"
+    return ""
+
+
+def a_la_papelera(ruta: str) -> bool:
+    """Manda un fichero a la papelera de reciclaje, sin diálogos."""
+    declarar_firmas()
+    origen = ctypes.create_unicode_buffer(os.path.abspath(ruta), len(os.path.abspath(ruta)) + 2)   # doble nulo
+    op = SHFILEOPSTRUCTW()
+    op.wFunc = FO_DELETE
+    op.pFrom = ctypes.cast(origen, ctypes.c_void_p)
+    op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI
+    return ctypes.windll.shell32.SHFileOperationW(ctypes.byref(op)) == 0 and not op.fAnyOperationsAborted
+
+
+def retirar_copias_antiguas(rutas, propia: str, intentos: int = 12, espera: float = 1.5) -> None:
+    """Manda a la papelera los ejecutables de la versión anterior.
+
+    La copia recién cerrada puede seguir bloqueada unos segundos mientras su
+    lanzador limpia sus temporales: se reintenta.
+    """
+    pendientes = []
+    for ruta in rutas:
+        if not ruta or any(_misma_ruta(ruta, p) for p in pendientes):
+            continue
+        motivo = motivo_para_no_retirar(ruta, propia)
+        if motivo:
+            if motivo not in ("ruta desconocida", "es esta misma copia", "ya no existe"):
+                registrar(f"versión anterior sin retirar ({motivo}): {ruta}")
+            continue
+        pendientes.append(ruta)
+    for _ in range(intentos):
+        if not pendientes:
+            return
+        for ruta in list(pendientes):
+            if a_la_papelera(ruta) and not os.path.exists(ruta):
+                registrar(f"versión anterior enviada a la papelera: {ruta}")
+                pendientes.remove(ruta)
+        if pendientes:
+            time.sleep(espera)
+    for ruta in pendientes:
+        registrar(f"versión anterior sin retirar (no se pudo mover a la papelera): {ruta}")
+
+
+# =========================================================================== #
+# Versiones nuevas
+#
+# El programa pregunta a GitHub cuál es la última versión publicada. Si es más
+# nueva, avisa y ofrece actualizar: descarga el ejecutable, comprueba su
+# SHA-256 contra el que publica GitHub, lo pone en lugar del actual y lo abre;
+# la copia nueva releva a esta. Nunca se actualiza sin que el usuario lo pida.
+# =========================================================================== #
+REPO = "ramagu/claude-usage"
+URL_RELEASES = f"https://github.com/{REPO}/releases/latest"
+# La variable de entorno solo la usan las pruebas automáticas.
+_URL_PRUEBAS = os.environ.get("CLAUDEUSAGE_URL_VERSION") or ""
+URL_ULTIMA = _URL_PRUEBAS or f"https://api.github.com/repos/{REPO}/releases/latest"
+NOMBRE_EXE = "ClaudeUsage.exe"
+NOMBRE_ANTERIOR = "ClaudeUsage.anterior.exe"
+NOMBRE_DESCARGA = "ClaudeUsage.descarga"
+BUSCAR_VERSION_CADA = 6 * 3600
+BUSCAR_VERSION_AL_ARRANCAR = 20
+
+
+class ErrorActualizacion(Exception):
+    """La descarga o la instalación de la versión nueva no se pudo completar."""
+
+
+def leer_publicacion(datos, mia: str = VERSION):
+    """De la respuesta de GitHub, la versión nueva que se puede ofrecer (o None)."""
+    if not isinstance(datos, dict) or datos.get("draft") or datos.get("prerelease"):
+        return None
+    version = str(datos.get("tag_name") or "").lstrip("vV")
+    if not es_mas_antigua(mia, version):
+        return None
+    info = {"version": version, "url": "", "sha256": "", "bytes": 0}
+    for fichero in datos.get("assets") or []:
+        if not isinstance(fichero, dict) or fichero.get("name") != NOMBRE_EXE:
+            continue
+        url = str(fichero.get("browser_download_url") or "")
+        resumen = re.fullmatch(r"sha256:([0-9a-fA-F]{64})", str(fichero.get("digest") or ""))
+        # Solo se instala sola si viene de las Releases del proyecto y trae su SHA-256.
+        if resumen and (_URL_PRUEBAS or url.startswith(f"https://github.com/{REPO}/releases/download/")):
+            try:
+                info.update(url=url, sha256=resumen.group(1).lower(), bytes=int(fichero.get("size") or 0))
+            except (TypeError, ValueError):
+                pass
+        break
+    return info
+
+
+def _abrir_url(url: str, espera: int = 15):
+    peticion = urllib.request.Request(url, headers={
+        "User-Agent": f"ClaudeUsage/{VERSION}", "Accept": "application/vnd.github+json, application/octet-stream"})
+    return urllib.request.urlopen(peticion, timeout=espera)
+
+
+def buscar_version_nueva():
+    """Consulta la última versión publicada. Devuelve su ficha o None si no hay."""
+    with _abrir_url(URL_ULTIMA) as r:
+        return leer_publicacion(json.loads(r.read(1024 * 1024).decode("utf-8")))
+
+
+def descargar_version(info: dict, destino: Path, progreso=None) -> None:
+    """Descarga el ejecutable nuevo y comprueba tamaño y SHA-256."""
+    resumen = hashlib.sha256()
+    recibido = 0
+    try:
+        with _abrir_url(info["url"], espera=30) as r, open(destino, "wb") as fh:
+            while True:
+                trozo = r.read(256 * 1024)
+                if not trozo:
+                    break
+                fh.write(trozo)
+                resumen.update(trozo)
+                recibido += len(trozo)
+                if recibido > 200 * 1024 * 1024:
+                    raise ErrorActualizacion("descarga demasiado grande")
+                if progreso and info["bytes"]:
+                    progreso(min(99, recibido * 100 // info["bytes"]))
+        if info["bytes"] and recibido != info["bytes"]:
+            raise ErrorActualizacion("descarga incompleta")
+        if resumen.hexdigest() != info["sha256"]:
+            raise ErrorActualizacion("la descarga no coincide con la publicada")
+    except ErrorActualizacion:
+        _borrar(destino)
+        raise
+    except (OSError, ValueError) as exc:
+        _borrar(destino)
+        raise ErrorActualizacion(type(exc).__name__) from None
+
+
+def _borrar(ruta) -> None:
+    try:
+        os.remove(ruta)
+    except OSError:
+        pass
+
+
+def instalar_descarga(descarga: Path, actual: Path) -> None:
+    """Pone la descarga en el sitio del ejecutable actual, que pasa a llamarse
+    ClaudeUsage.anterior.exe (Windows deja renombrar un programa en marcha).
+    Si algo falla, lo deja todo como estaba."""
+    anterior = actual.with_name(NOMBRE_ANTERIOR)
+    try:
+        if anterior.exists():
+            os.remove(anterior)
+        os.rename(actual, anterior)
+    except OSError as exc:
+        _borrar(descarga)
+        raise ErrorActualizacion(f"no se puede escribir en la carpeta ({type(exc).__name__})") from None
+    try:
+        os.rename(descarga, actual)
+    except OSError as exc:
+        os.rename(anterior, actual)
+        _borrar(descarga)
+        raise ErrorActualizacion(type(exc).__name__) from None
+
+
+def lanzar_copia(ruta: Path, argumentos=()) -> None:
+    """Abre otra copia del programa como si se hiciera doble clic: sin heredar
+    las variables con las que PyInstaller arrancó esta."""
+    entorno = {k: v for k, v in os.environ.items()
+               if not k.upper().startswith(("_PYI", "_MEI", "TCL_LIBRARY", "TK_LIBRARY", "TCLLIBPATH"))}
+    entorno["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+    subprocess.Popen([str(ruta), *argumentos], env=entorno, close_fds=True,
+                     creationflags=0x00000008 | 0x00000200)      # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
 
 
 def barra_tareas_clara() -> bool:
@@ -1422,7 +1810,7 @@ class Bandeja:
     NIN_POPUPOPEN / NIN_POPUPCLOSE: ahí se muestra y se oculta la tarjeta propia.
     """
 
-    CLASE = "ClaudeUsageTrayWnd"
+    CLASE = CLASE_BANDEJA
 
     def __init__(self, root, acciones):
         self.root = root
@@ -1438,6 +1826,7 @@ class Bandeja:
         declarar_firmas()
         self._u, self._s, self._k = ctypes.windll.user32, ctypes.windll.shell32, ctypes.windll.kernel32
         self._msg_taskbar = self._u.RegisterWindowMessageW("TaskbarCreated")
+        self._msg_relevo = self._u.RegisterWindowMessageW(MENSAJE_RELEVO)
         # Las referencias al callback y a la clase deben sobrevivir al GC.
         self._wndproc = WNDPROC(self._procesar)
         self._clase = None
@@ -1534,6 +1923,10 @@ class Bandeja:
             return 0
         if self._msg_taskbar and msg == self._msg_taskbar:
             self._poner_icono()
+            return 0
+        if self._msg_relevo and msg == self._msg_relevo:
+            # Una versión más nueva acaba de abrirse y pide el sitio.
+            self._pendientes.append("relevo")
             return 0
         if msg == WM_DESTROY:
             return 0
@@ -1638,7 +2031,9 @@ class Bandeja:
 # =========================================================================== #
 # Inicio automático con Windows
 # =========================================================================== #
-CLAVE_RUN = r"Software\Microsoft\Windows\CurrentVersion\Run"
+# La variable de entorno solo la usan las pruebas automáticas, para no tocar el
+# inicio real del equipo.
+CLAVE_RUN = os.environ.get("CLAUDEUSAGE_CLAVE_RUN") or r"Software\Microsoft\Windows\CurrentVersion\Run"
 
 
 def _winreg():
@@ -1703,6 +2098,33 @@ def autostart_poner(activar: bool) -> bool:
         return True
     except OSError:
         return False
+
+
+def adoptar_autostart() -> str:
+    """Si el inicio con Windows apunta a otra copia de Claude Usage, lo pasa a
+    esta. Devuelve la ruta de la copia anterior ("" si no había nada que hacer).
+
+    Solo se llama al relevar a una versión más antigua: así el equipo no vuelve
+    a arrancar con la vieja en el siguiente inicio de sesión.
+    """
+    w = _winreg()
+    if w is None or not esta_congelado():
+        return ""
+    try:
+        with w.OpenKey(w.HKEY_CURRENT_USER, CLAVE_RUN) as k:
+            valor, _ = w.QueryValueEx(k, APP_NAME)
+    except OSError:
+        return ""
+    anterior = _objetivo(valor) if isinstance(valor, str) else ""
+    if not anterior or anterior == _objetivo(comando_arranque()):
+        return ""
+    nombre = os.path.basename(anterior)
+    if not (nombre.startswith(APP_NAME.casefold()) and nombre.endswith(".exe")):
+        return ""                        # p. ej. una copia en desarrollo con pythonw: no es nuestra
+    if not autostart_poner(True):
+        return ""
+    registrar(f"inicio con Windows pasado a esta copia (antes: {anterior})")
+    return anterior
 
 
 # =========================================================================== #
@@ -1970,15 +2392,37 @@ class App:
                     ID_AUTOSTART: lambda: autostart_poner(not autostart_activo()),
                     ID_ACERCA: self._acerca,
                     ID_SALIR: self.salir,
+                    "relevo": lambda: self.salir("salida por relevo: se ha abierto una versión más nueva"),
                 })
             except OSError as exc:
                 registrar(f"no se pudo crear el icono de la bandeja: {exc!r}")
 
+        # Versión nueva publicada (ficha de leer_publicacion) y estado de la actualización.
+        self.novedad = None
+        self.actualizando = False
+        self.progreso_descarga = 0
+        self.error_actualizacion = ""
+        self._despertar_versiones = threading.Event()
+        # «--actualizar»: quien lo abre así pide instalar la versión nueva sin pasar por el botón.
+        self._actualizar_sin_preguntar = "--actualizar" in sys.argv
+        if self._actualizar_sin_preguntar:
+            self._despertar_versiones.set()
+
         threading.Thread(target=self._trabajador, daemon=True, name="lecturas").start()
+        threading.Thread(target=self._vigia_versiones, daemon=True, name="versiones").start()
         self.root.after(200, self._leer_cola)
         self._pintar_icono()
         if not silencioso or not self.api or self.bandeja is None:
             self.root.after(100, self.mostrar_panel)
+        if VERSION_RELEVADA:
+            self.root.after(2500, self._avisar_relevo)
+
+    def _avisar_relevo(self) -> None:
+        if self.bandeja:
+            self.accion_aviso = "panel"
+            self.bandeja.avisar(T("Claude Usage actualizado a la versión {v}", v=VERSION),
+                                T("La versión {anterior} se ha cerrado y esta ocupa su lugar. Tu clave y tu historial se conservan.",
+                                  anterior=VERSION_RELEVADA), AZUL, self.cfg.sonido)
 
     # ------------------------------------------------------------------ #
     # Lecturas en segundo plano
@@ -2006,6 +2450,96 @@ class App:
     def actualizar_ahora(self) -> None:
         self._despertar.set()
 
+    # ------------------------------------------------------------------ #
+    # Versiones nuevas
+    # ------------------------------------------------------------------ #
+    def _vigia_versiones(self) -> None:
+        espera = BUSCAR_VERSION_AL_ARRANCAR
+        while self._vivo:
+            self._despertar_versiones.wait(espera)
+            self._despertar_versiones.clear()
+            if not self._vivo:
+                return
+            espera = BUSCAR_VERSION_CADA
+            if not (self.cfg.buscar_versiones or self._actualizar_sin_preguntar):
+                continue
+            try:
+                self.cola.put(("version", buscar_version_nueva()))
+            except Exception as exc:  # noqa: BLE001 — sin red, límite de GitHub…: se reintenta más tarde
+                registrar(f"no se pudo consultar la última versión: {type(exc).__name__}")
+
+    def _version_consultada(self, info) -> None:
+        cambio = (info or {}).get("version") != (self.novedad or {}).get("version")
+        self.novedad = info
+        if info and self.cfg.version_avisada != info["version"]:
+            registrar(f"versión nueva disponible: {info['version']}")
+            self.cfg.version_avisada = info["version"]
+            self.cfg.guardar()
+            self._avisar(T("Hay una versión nueva de Claude Usage: {v}", v=info["version"]),
+                         T("Haz clic aquí para actualizar."), AZUL, "panel")
+        if cambio and self.panel_visible():
+            self.redibujar()
+        if info and self._actualizar_sin_preguntar and esta_congelado() and info["sha256"]:
+            self.actualizar_version()
+
+    def actualizar_version(self) -> None:
+        info = self.novedad
+        if not info or self.actualizando:
+            return
+        if not esta_congelado() or not info["sha256"]:
+            self.abrir_web_version()
+            return
+        self.actualizando, self.progreso_descarga, self.error_actualizacion = True, 0, ""
+        self.redibujar()
+        actual = Path(sys.executable).resolve()
+
+        def trabajo():
+            try:
+                descarga = actual.with_name(NOMBRE_DESCARGA)
+                descargar_version(info, descarga, lambda n: self.cola.put(("descarga", n)))
+                instalar_descarga(descarga, actual)
+                self.cola.put(("instalada", info["version"], actual))
+            except ErrorActualizacion as exc:
+                self.cola.put(("sin_actualizar", str(exc)))
+            except Exception as exc:  # noqa: BLE001
+                self.cola.put(("sin_actualizar", type(exc).__name__))
+
+        threading.Thread(target=trabajo, daemon=True, name="actualizacion").start()
+
+    def _version_instalada(self, version: str, ruta: Path) -> None:
+        registrar(f"versión {version} descargada e instalada: se abre y releva a esta")
+        try:
+            # Al arrancar, la nueva cierra esta copia y retira el ejecutable anterior. Con el
+            # botón se abre con el panel, para que se vea el cambio; con «--actualizar», callada.
+            lanzar_copia(ruta, ["--silent"] if self._actualizar_sin_preguntar else [])
+        except Exception as exc:  # noqa: BLE001
+            self._deshacer_actualizacion(ruta, type(exc).__name__)
+            return
+        # Si en un rato la nueva no ha relevado a esta copia es que no arranca: se deshace.
+        self.root.after(25000, lambda: self._deshacer_actualizacion(ruta, "la versión nueva no arranca"))
+
+    def _deshacer_actualizacion(self, ruta: Path, detalle: str) -> None:
+        anterior = ruta.with_name(NOMBRE_ANTERIOR)
+        try:
+            if anterior.exists():
+                os.replace(anterior, ruta)       # vuelve el ejecutable de esta versión
+        except OSError as exc:
+            registrar(f"no se pudo deshacer la actualización: {type(exc).__name__}")
+        self._sin_actualizar(detalle)
+
+    def _sin_actualizar(self, detalle: str) -> None:
+        registrar(f"no se pudo actualizar: {detalle}")
+        self.actualizando = False
+        self.error_actualizacion = detalle
+        if self.panel_visible():
+            self.redibujar()
+
+    def abrir_web_version(self) -> None:
+        try:
+            os.startfile(URL_RELEASES)
+        except (OSError, AttributeError) as exc:
+            registrar(f"no se pudo abrir la web: {type(exc).__name__}")
+
     def _leer_cola(self) -> None:
         try:
             while True:
@@ -2022,6 +2556,17 @@ class App:
                     self.validando = False
                     self.error_clave = msg[1]
                     self.redibujar()
+                elif msg[0] == "version":
+                    self._version_consultada(msg[1])
+                elif msg[0] == "descarga":
+                    if msg[1] != self.progreso_descarga:
+                        self.progreso_descarga = msg[1]
+                        if self.panel_visible() and self.vista == "principal":
+                            self.redibujar()
+                elif msg[0] == "instalada":
+                    self._version_instalada(msg[1], msg[2])
+                elif msg[0] == "sin_actualizar":
+                    self._sin_actualizar(msg[1])
         except queue.Empty:
             pass
         if self._vivo:
@@ -2548,6 +3093,8 @@ class App:
     # ------------------------------------------------------------------ #
     def _cuerpo(self, padre) -> None:
         e = self.e
+        if self.novedad:
+            self._aviso_version(padre)
         if not self.api:
             self._primer_arranque(padre)
             return
@@ -2635,6 +3182,32 @@ class App:
         self.L(textos, t, 12.5, C["texto"], "bold").pack(anchor="w")
         self.L(textos, x, 11.5, C["suave"], wraplength=e.px(190)).pack(anchor="w")
         self.boton_pequeno(caja, b, accion).pack(side="right", padx=e.px(10))
+
+    def _aviso_version(self, padre) -> None:
+        e = self.e
+        info = self.novedad
+        caja_b = tk.Frame(padre, bg=C["banda_borde"])
+        caja_b.pack(fill="x", padx=e.px(12), pady=(e.px(12), 0))
+        caja = tk.Frame(caja_b, bg=C["banda"])
+        caja.pack(fill="x", padx=1, pady=1)
+        textos = tk.Frame(caja, bg=C["banda"])
+        textos.pack(side="left", fill="x", expand=True, padx=(e.px(11), 0), pady=e.px(9))
+        self.L(textos, T("Versión {v} disponible", v=info["version"]), 12.5, C["texto"], "bold").pack(anchor="w")
+        if self.actualizando:
+            detalle = T("Descargando… {n} %", n=self.progreso_descarga)
+        elif self.error_actualizacion:
+            detalle = T("No se pudo actualizar ({detalle}). Descárgala desde la web.", detalle=self.error_actualizacion)
+        elif esta_congelado() and info["sha256"]:
+            detalle = T("Tienes la {actual}. Se descarga y se instala sola.", actual=VERSION)
+        else:
+            detalle = T("Tienes la {actual}. Descárgala desde la web.", actual=VERSION)
+        self.L(textos, detalle, 11.5, C["suave"], wraplength=e.px(190)).pack(anchor="w")
+        if self.actualizando:
+            return
+        if self.error_actualizacion or not (esta_congelado() and info["sha256"]):
+            self.boton_pequeno(caja, T("Abrir la web"), self.abrir_web_version).pack(side="right", padx=e.px(10))
+        else:
+            self.boton_pequeno(caja, T("Actualizar"), self.actualizar_version).pack(side="right", padx=e.px(10))
 
     def _ir_a_clave(self) -> None:
         self.vista, self.ver_clave, self.grafico = "menu", True, False
@@ -3187,6 +3760,8 @@ class App:
         self._grupo(cuerpo, T("Preferencias"))
         f = self._fila(cuerpo, "encendido", T("Iniciar con Windows"))
         self.interruptor(f, autostart_activo(), self._alternar_autostart).pack(side="right")
+        f = self._fila(cuerpo, "campana", T("Avisar de versiones nuevas"))
+        self.interruptor(f, self.cfg.buscar_versiones, self._alternar_versiones).pack(side="right")
         f = self._fila(cuerpo, "ojo", T("Paleta accesible"))
         self.interruptor(f, self.cfg.accesible, lambda: self._alternar_pref("accesible")).pack(side="right")
         f = self._fila(cuerpo, "reloj", T("Refresco"))
@@ -3339,6 +3914,15 @@ class App:
             self._pintar_icono()
         self.redibujar()
 
+    def _alternar_versiones(self) -> None:
+        self.cfg.buscar_versiones = not self.cfg.buscar_versiones
+        self.cfg.guardar()
+        if self.cfg.buscar_versiones:
+            self._despertar_versiones.set()      # consulta ya, sin esperar al siguiente turno
+        else:
+            self.novedad = None
+        self.redibujar()
+
     def _alternar_autostart(self) -> None:
         autostart_poner(not autostart_activo())
         self.redibujar()
@@ -3476,12 +4060,12 @@ class App:
         pie.pack(fill="x", padx=e.px(16), pady=(e.px(14), e.px(14)))
         self.boton(pie, T("Volver"), self._volver_principal, icono="volver", lleno=True).pack(fill="x")
 
-    def salir(self) -> None:
+    def salir(self, motivo: str = "salida a petición del usuario") -> None:
         self._vivo = False
         self._despertar.set()
         if self.bandeja:
             self.bandeja.cerrar()
-        registrar("salida a petición del usuario")
+        registrar(motivo)
         try:
             self.root.destroy()
         except tk.TclError:
@@ -3491,11 +4075,34 @@ class App:
         self.root.mainloop()
 
 
+VERSION_RELEVADA = ""    # versión anterior a la que esta copia ha sustituido al arrancar
+
+
 def main() -> None:
+    global VERSION_RELEVADA
     silencioso = "--silent" in sys.argv
+    anterior = ultima_version_arrancada()          # antes de registrar el arranque propio
+    soy_mas_nueva = es_mas_antigua(anterior)
+    antiguas = []
     if not es_unica_instancia():
-        return
+        # Ya hay una copia en marcha. Si es igual o más nueva, se queda ella.
+        if not soy_mas_nueva:
+            return
+        ruta = relevar_instancia(anterior)
+        if ruta is None:
+            return
+        antiguas.append(ruta)
+        VERSION_RELEVADA = anterior
     registrar(f"arranque {VERSION} ({'silencioso' if silencioso else 'con panel'})")
+    if esta_congelado():
+        propia = Path(sys.executable).resolve()
+        if soy_mas_nueva:
+            antiguas.append(adoptar_autostart())
+        # Lo que deja una actualización hecha desde el propio programa.
+        antiguas.append(str(propia.with_name(NOMBRE_ANTERIOR)))
+        _borrar(propia.with_name(NOMBRE_DESCARGA))
+        threading.Thread(target=retirar_copias_antiguas, args=(antiguas, str(propia)), daemon=True,
+                         name="retirada").start()
     App(silencioso).ejecutar()
 
 

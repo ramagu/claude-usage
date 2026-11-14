@@ -14,6 +14,25 @@ la clave.
 instalar Python: se ejecuta, se pega la SessionKey de claude.ai y queda en la
 bandeja.
 
+## Actualizaciones
+
+Desde la 1.3.0 el programa pregunta a GitHub cada pocas horas si hay una versión
+nueva publicada. Si la hay, avisa con una notificación y muestra en el panel el
+botón **Actualizar**: descarga el ejecutable de Releases, comprueba su SHA-256
+contra el que publica GitHub, lo pone en el lugar del actual y abre la versión
+nueva. Nunca se actualiza sin que lo pidas, y el aviso se puede apagar en
+Menú › Preferencias › Avisar de versiones nuevas. La consulta solo envía a
+GitHub la versión que tienes.
+
+También vale abrir a mano un `ClaudeUsage.exe` más nuevo, aunque esté en otra
+carpeta: cierra la versión anterior que estuviera en marcha, se queda con el
+inicio con Windows y manda el ejecutable antiguo a la papelera. La clave y el
+historial se conservan. No retira copias que estén en OneDrive u otra carpeta
+sincronizada, porque pueden ser de varias personas.
+
+`ClaudeUsage.exe --actualizar` instala la versión nueva, si la hay, sin pasar
+por el botón.
+
 ## Qué hace
 
 - **Icono de bandeja** teñido con el color del tramo de uso. Azul mientras no
