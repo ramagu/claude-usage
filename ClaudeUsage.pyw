@@ -51,7 +51,7 @@ import zlib
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 APP_NAME = "ClaudeUsage"
 TITULO = "Claude Usage"
 
@@ -131,7 +131,7 @@ PASOS_SESSIONKEY = (
     ("Arriba, entra en la pestaña Application (Almacenamiento en Firefox). Si no aparece, pulsa ».", "Application"),
     ("En la columna izquierda, despliega Cookies y elige claude.ai.", "Storage › Cookies › https://claude.ai"),
     ("Escribe «session» en el filtro y selecciona la fila sessionKey.", "sessionKey"),
-    ("Doble clic en la columna Value, Ctrl+A y Ctrl+C. Empieza así:", "sk-ant-sid01-…"),
+    ("Doble clic en la columna Value, Ctrl+A y Ctrl+C. Empieza así:", "sk-ant-sid…"),
     ("Pégala en el campo y pulsa Validar. Si cierras sesión en claude.ai, la clave deja de valer.", ""),
 )
 
@@ -209,8 +209,10 @@ EN = {
     "{modelo} (semanal) al {v} %": "{modelo} (weekly) at {v}%",
     "Reinicia el {cuando}, en {falta}.": "Resets {cuando}, in {falta}.",
     # SessionKey
-    "No es una SessionKey válida. Debe empezar por sk-ant-sid01- y copiarse entera, sin espacios.":
-        "That's not a valid SessionKey. It must start with sk-ant-sid01- and be copied in full, without spaces.",
+    "Eso no es la SessionKey: debe empezar por sk-ant-sid. Copia el valor de la fila sessionKey y pégalo de nuevo.":
+        "That's not the SessionKey: it must start with sk-ant-sid. Copy the value of the sessionKey row and paste it again.",
+    "La SessionKey está incompleta o lleva caracteres de más. Cópiala entera y pégala de nuevo.":
+        "The SessionKey is incomplete or has extra characters. Copy it in full and paste it again.",
     "claude.ai ha rechazado la clave. Puede haber caducado: vuelve a copiarla.":
         "claude.ai rejected the key. It may have expired: copy it again.",
     "No se pudo comprobar la clave ({detalle}). Revisa la conexión.": "Couldn't check the key ({detalle}). Check your connection.",
@@ -476,8 +478,30 @@ def descifrar_clave(cifrada: str) -> str:
         return ""
 
 
+PREFIJO_CLAVE = re.compile(r"sk-ant-sid\d+-")
+# Lo que admite el valor de una cookie (RFC 6265): ASCII visible sin comillas,
+# coma, punto y coma ni barra inversa. claude.ai decide si la clave vale; aquí
+# solo se descartan los errores evidentes de copiado.
+_CUERPO_CLAVE = r"[\x21\x23-\x2B\x2D-\x3A\x3C-\x5B\x5D-\x7E]"
+_INVISIBLES = re.compile(r"[\s​‌‍⁠﻿]+")
+
+
+def limpiar_clave(texto: str) -> str:
+    """Deja solo la clave de lo que se ha pegado o escrito.
+
+    Quita espacios, saltos de línea y caracteres invisibles, y recorta lo que
+    acompañe a la clave: comillas, «sessionKey=», otras cookies o una clave
+    anterior que se hubiera quedado en el campo (vale la última).
+    """
+    texto = _INVISIBLES.sub("", texto or "")
+    inicios = [m.start() for m in PREFIJO_CLAVE.finditer(texto)]
+    if not inicios:
+        return texto
+    return re.match(PREFIJO_CLAVE.pattern + _CUERPO_CLAVE + "*", texto[inicios[-1]:]).group(0)
+
+
 def formato_clave_valido(clave: str) -> bool:
-    return bool(re.fullmatch(r"sk-ant-sid\d{2}-[A-Za-z0-9_\-]{20,}", clave.strip()))
+    return bool(re.fullmatch(PREFIJO_CLAVE.pattern + _CUERPO_CLAVE + "{20,}", clave))
 
 
 # =========================================================================== #
@@ -2050,11 +2074,20 @@ class App:
     # SessionKey
     # ------------------------------------------------------------------ #
     def validar_clave(self) -> None:
-        clave = self.clave_borrador.get().strip()
-        if not clave or self.validando:
+        if self.validando:
+            return
+        clave = limpiar_clave(self.clave_borrador.get())
+        if not clave:
+            self.clave_borrador.set("")
             return
         if not formato_clave_valido(clave):
-            self.error_clave = T("No es una SessionKey válida. Debe empezar por sk-ant-sid01- y copiarse entera, sin espacios.")
+            # El campo oculta lo escrito: se vacía para que el siguiente intento
+            # no se sume a este.
+            self.clave_borrador.set("")
+            if PREFIJO_CLAVE.search(clave):
+                self.error_clave = T("La SessionKey está incompleta o lleva caracteres de más. Cópiala entera y pégala de nuevo.")
+            else:
+                self.error_clave = T("Eso no es la SessionKey: debe empezar por sk-ant-sid. Copia el valor de la fila sessionKey y pégalo de nuevo.")
             self.redibujar()
             return
         self.validando = True
@@ -2648,10 +2681,24 @@ class App:
         entrada.bind("<FocusIn>", lambda _e: borde.configure(bg=C["acento"]))
         entrada.bind("<FocusOut>", lambda _e: borde.configure(bg=C["borde"]))
         entrada.bind("<Key>", lambda ev: self._limpiar_error_clave() if ev.keysym != "Return" else None, add="+")
+        entrada.bind("<<Paste>>", lambda _e: self._pegar_clave(entrada))
         self.boton(fila, T("Validando…") if self.validando else texto_boton, self.validar_clave).pack(side="right")
         if self.error_clave:
             self.L(padre, self.error_clave, 11, self.tonos()["red"], wraplength=e.px(290)).pack(anchor="w", pady=(e.px(6), 0))
         self.root.after(50, lambda: entrada.winfo_exists() and entrada.focus_set())
+
+    def _pegar_clave(self, entrada) -> str:
+        """Pegar sustituye lo que hubiera: el campo oculta su contenido y un
+        resto de un intento anterior invalidaría la clave sin que se vea."""
+        try:
+            texto = self.root.clipboard_get()
+        except tk.TclError:
+            return "break"
+        self.clave_borrador.set(limpiar_clave(texto))
+        if entrada.winfo_exists():
+            entrada.icursor("end")
+        self._limpiar_error_clave()
+        return "break"
 
     def _limpiar_error_clave(self) -> None:
         if self.error_clave:
