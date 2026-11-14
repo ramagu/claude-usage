@@ -61,7 +61,7 @@ from pathlib import Path
 # archivo que ya no es el suyo («Error -3 while decompressing data»). traceback
 # lo usa tkinter si una acción falla, y también lo importaría tarde.
 
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 APP_NAME = "ClaudeUsage"
 TITULO = "Claude Usage"
 
@@ -1071,6 +1071,9 @@ if ES_WINDOWS:
             ("guidItem", GUID), ("hBalloonIcon", wintypes.HICON),
         ]
 
+    class NOTIFYICONIDENTIFIER(ctypes.Structure):
+        _fields_ = [("cbSize", wintypes.DWORD), ("hWnd", wintypes.HWND), ("uID", wintypes.UINT), ("guidItem", GUID)]
+
     class WNDCLASSW(ctypes.Structure):
         _fields_ = [
             ("style", wintypes.UINT), ("lpfnWndProc", WNDPROC), ("cbClsExtra", ctypes.c_int),
@@ -1174,6 +1177,8 @@ if ES_WINDOWS:
         k.GetDriveTypeW.restype = wintypes.UINT
         s.SHFileOperationW.argtypes = (ctypes.c_void_p,)
         s.SHFileOperationW.restype = ctypes.c_int
+        s.Shell_NotifyIconGetRect.argtypes = (ctypes.c_void_p, ctypes.c_void_p)
+        s.Shell_NotifyIconGetRect.restype = ctypes.c_long
         _FIRMAS = True
 
 
@@ -1860,6 +1865,26 @@ class Bandeja:
         d.hIcon = self.icono or 0
         d.szTip = self.tip[:127]
         return d
+
+    def centro_icono(self):
+        """Coordenada X del centro del icono en la bandeja, o None si Windows no la da.
+
+        La tarjeta se centra aquí. La X que trae NIN_POPUPOPEN es la del ratón al
+        entrar en el icono: según por dónde se entrase, la tarjeta salía corrida.
+        """
+        if not self.hwnd:
+            return None
+        ident = NOTIFYICONIDENTIFIER()
+        ident.cbSize = ctypes.sizeof(NOTIFYICONIDENTIFIER)
+        ident.hWnd = self.hwnd
+        ident.uID = 1
+        r = wintypes.RECT()
+        try:
+            if self._s.Shell_NotifyIconGetRect(ctypes.byref(ident), ctypes.byref(r)) != 0:
+                return None
+        except (OSError, AttributeError):
+            return None
+        return (r.left + r.right) // 2 if r.right > r.left else None
 
     def _poner_icono(self, exigir: bool = False) -> None:
         d = self._datos(NIF_MESSAGE | NIF_ICON | NIF_TIP)
@@ -3989,7 +4014,9 @@ class App:
             py = e.px(3)
             for i, l in enumerate(self.limites):
                 self.L(filas, l["nombre"], 11.5, claro, "bold").grid(row=i, column=0, sticky="w", pady=py)
-                self.barra(filas, l["pct"], self.color(l["pct"]) if vivo else GRIS, e.px(110)).grid(
+                # La rayita blanca del ritmo ideal, igual que en el panel.
+                ideal = fraccion_transcurrida(l["reinicio"], ventana_limite(l["clave"])) if l["reinicio"] else None
+                self.barra(filas, l["pct"], self.color(l["pct"]) if vivo else GRIS, e.px(110), marca=ideal).grid(
                     row=i, column=1, padx=(e.px(12), e.px(12)), pady=py)
                 self.L(filas, pct_txt(l["pct"]), 11.5, claro, "bold", anchor="e").grid(row=i, column=2, sticky="e", pady=py)
                 self.L(filas, cuando_reinicia(l["reinicio"], corto=True), 10.5, C["tenue"], anchor="e").grid(
@@ -4020,7 +4047,8 @@ class App:
         cv.create_oval(0, 0, s, s, fill=punto, outline=punto)
         cv.pack(side="left", padx=(0, e.px(7)))
         self.L(dentro, texto, 11, C["texto_2"]).pack(side="left")
-        self._colocar(self.tarjeta, ancla_x=x)
+        centro = self.bandeja.centro_icono() if self.bandeja else None
+        self._colocar(self.tarjeta, ancla_x=x if centro is None else centro)
         self.tarjeta.deiconify()
         self.tarjeta.lift()
         redondear_esquinas(self.tarjeta)
