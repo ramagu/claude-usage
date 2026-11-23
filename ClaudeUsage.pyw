@@ -61,7 +61,7 @@ from pathlib import Path
 # archivo que ya no es el suyo («Error -3 while decompressing data»). traceback
 # lo usa tkinter si una acción falla, y también lo importaría tarde.
 
-VERSION = "1.3.1"
+VERSION = "1.3.2"
 APP_NAME = "ClaudeUsage"
 TITULO = "Claude Usage"
 
@@ -238,8 +238,8 @@ EN = {
         "That's not the SessionKey: it must start with sk-ant-sid. Copy the value of the sessionKey row and paste it again.",
     "La SessionKey está incompleta o lleva caracteres de más. Cópiala entera y pégala de nuevo.":
         "The SessionKey is incomplete or has extra characters. Copy it in full and paste it again.",
-    "claude.ai ha rechazado la clave. Puede haber caducado: vuelve a copiarla.":
-        "claude.ai rejected the key. It may have expired: copy it again.",
+    "claude.ai ha rechazado la clave ({detalle}). Puede haber caducado o ser de otra cuenta: vuelve a copiarla.":
+        "claude.ai rejected the key ({detalle}). It may have expired or belong to another account: copy it again.",
     "No se pudo comprobar la clave ({detalle}). Revisa la conexión.": "Couldn't check the key ({detalle}). Check your connection.",
     "No se pudo comprobar la clave ({detalle}).": "Couldn't check the key ({detalle}).",
     "La clave es válida, pero no se pudo guardar cifrada en este equipo.":
@@ -738,7 +738,15 @@ CABECERAS = {
 
 
 class ErrorClave(Exception):
-    """401/403: la clave no vale o ha caducado."""
+    """401/403: la clave no vale o ha caducado.
+
+    `detalle` dice qué respondió claude.ai (código, ruta sin UUID y tipo de
+    error), para distinguir una clave caducada de una cuenta sin acceso.
+    """
+
+    def __init__(self, mensaje: str, detalle: str = ""):
+        super().__init__(mensaje)
+        self.detalle = detalle
 
 
 class ErrorConexion(Exception):
@@ -763,15 +771,31 @@ class ClaudeAPI:
                 cuerpo = r.read()
         except urllib.error.HTTPError as exc:
             try:
-                inicio = exc.read(64)
+                inicio = exc.read(1024)
             except Exception:  # noqa: BLE001
                 inicio = b""
-            if exc.code == 401:
-                raise ErrorClave("claude.ai ha rechazado la clave (401).") from None
-            if exc.code == 403:
-                if b"<!DOCTYPE" in inicio or b"<html" in inicio:
-                    raise ErrorConexion("Bloqueado por Cloudflare") from None
-                raise ErrorClave("Acceso denegado (403).") from None
+            bajo = inicio.lower()
+            es_desafio = (exc.headers.get("cf-mitigated") is not None
+                          or bajo.lstrip()[:9] in (b"<!doctype", b"<html lan", b"<html>")
+                          or b"<html" in bajo[:64] or b"just a moment" in bajo)
+            if exc.code in (401, 403) and not es_desafio:
+                ruta_log = re.sub(r"[0-9a-fA-F]{8}-[0-9a-fA-F-]{27}", "{org}", ruta)
+                tipo = ""
+                try:
+                    err = json.loads(inicio.decode("utf-8")).get("error")
+                    tipo = str(err.get("type", "") if isinstance(err, dict) else "")[:40]
+                    cod = err.get("details", {}).get("error_code", "") if isinstance(err, dict) and isinstance(err.get("details"), dict) else ""
+                    if cod:
+                        tipo += f"/{str(cod)[:40]}"
+                except Exception:  # noqa: BLE001
+                    pass
+                detalle = f"HTTP {exc.code} en {ruta_log}" + (f", {tipo}" if tipo else "")
+                registrar(f"claude.ai rechaza: {detalle}")
+                raise ErrorClave(f"claude.ai ha rechazado la clave ({exc.code}).", detalle) from None
+            if es_desafio and exc.code in (403, 503):
+                registrar(f"claude.ai devuelve una página de desafío: HTTP {exc.code}, "
+                          f"server={exc.headers.get('server', '?')}, cf-mitigated={exc.headers.get('cf-mitigated', '-')}")
+                raise ErrorConexion("Bloqueado por Cloudflare") from None
             raise ErrorConexion(f"HTTP {exc.code}") from None
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             raise ErrorConexion(type(exc).__name__) from None
@@ -963,7 +987,15 @@ class Historial:
 # =========================================================================== #
 # Análisis: ritmo, proyección
 # =========================================================================== #
-def ritmo_por_hora(puntos: list, ventana_min: int = 20, minimo: int = 3) -> float | None:
+# Calibrado con 77 sesiones de 5 h reales (3.500 puntos): el uso llega en enteros de 1 % y a
+# ráfagas, así que una recta sobre 20 min sobrestima el consumo futuro. Con 60 min y la
+# pendiente a la mitad, el error medio al predecir el uso final baja de 17,6 a 14,5 puntos.
+VENTANA_RITMO_MIN = 60
+FACTOR_RITMO = 0.5
+USO_MIN_PROYECCION = 30     # por debajo, extrapolar es ruido: no se avisa de «llegarás al 100 %»
+
+
+def ritmo_por_hora(puntos: list, ventana_min: int = VENTANA_RITMO_MIN, minimo: int = 3) -> float | None:
     """Pendiente %/h por mínimos cuadrados sobre los últimos minutos. None si es plana."""
     if len(puntos) < minimo:
         return None
@@ -983,14 +1015,21 @@ def ritmo_por_hora(puntos: list, ventana_min: int = 20, minimo: int = 3) -> floa
 
 
 def proyectar(pct: float, ritmo: float | None, reinicio: datetime | None) -> dict:
-    """eta_100: cuándo se llegaría al 100 % antes del reinicio; sobra: % sin usar al reiniciar."""
+    """eta_100: cuándo se llegaría al 100 % antes del reinicio; sobra: % sin usar al reiniciar.
+
+    Se proyecta con la pendiente amortiguada (FACTOR_RITMO). Con poco uso acumulado
+    no se proyecta nada: una sola ráfaga daría falsas alarmas de agotamiento.
+    """
     if not ritmo or not reinicio:
         return {"eta_100": None, "sobra": None}
     horas = (reinicio - ahora()).total_seconds() / 3600
     if horas <= 0:
         return {"eta_100": None, "sobra": None}
+    ritmo = ritmo * FACTOR_RITMO
     horas_100 = (100 - pct) / ritmo
     if horas_100 < horas:
+        if pct < USO_MIN_PROYECCION:
+            return {"eta_100": None, "sobra": None}
         return {"eta_100": ahora() + timedelta(hours=horas_100), "sobra": 0}
     return {"eta_100": None, "sobra": max(0, round(100 - (pct + ritmo * horas)))}
 
@@ -2668,8 +2707,8 @@ class App:
             api = ClaudeAPI(clave)
             try:
                 self.cola.put(("validada", api, api.leer()))
-            except ErrorClave:
-                self.cola.put(("invalida", T("claude.ai ha rechazado la clave. Puede haber caducado: vuelve a copiarla.")))
+            except ErrorClave as exc:
+                self.cola.put(("invalida", T("claude.ai ha rechazado la clave ({detalle}). Puede haber caducado o ser de otra cuenta: vuelve a copiarla.", detalle=exc.detalle or "?")))
             except ErrorConexion as exc:
                 self.cola.put(("invalida", T("No se pudo comprobar la clave ({detalle}). Revisa la conexión.", detalle=T(str(exc)))))
             except Exception as exc:  # noqa: BLE001
